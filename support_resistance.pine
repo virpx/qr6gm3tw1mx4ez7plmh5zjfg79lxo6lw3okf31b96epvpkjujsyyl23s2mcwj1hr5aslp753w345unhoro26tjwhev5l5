@@ -1,0 +1,354 @@
+//@version=5
+indicator("Support & Resistance Levels", "S&R", overlay=true, max_lines_count=500, max_labels_count=100)
+
+// === INPUT PARAMETERS ===
+// Pivot detection settings
+pivot_length = input.int(5, "Pivot Length", minval=1, maxval=50, tooltip="Number of bars to look left and right for pivot detection")
+min_touches = input.int(2, "Minimum Touches", minval=2, maxval=10, tooltip="Minimum number of touches required to validate a level")
+touch_tolerance = input.float(0.1, "Touch Tolerance %", minval=0.01, maxval=2.0, tooltip="Percentage tolerance for price touches")
+
+// Level filtering
+max_levels = input.int(10, "Maximum Levels", minval=1, maxval=20, tooltip="Maximum number of support/resistance levels to display")
+min_strength = input.int(2, "Minimum Strength", minval=1, maxval=10, tooltip="Minimum strength score to display a level")
+lookback_bars = input.int(200, "Lookback Bars", minval=50, maxval=1000, tooltip="Number of bars to look back for level detection")
+
+// Visual settings
+show_support = input.bool(true, "Show Support Levels", group="Display")
+show_resistance = input.bool(true, "Show Resistance Levels", group="Display")
+show_labels = input.bool(true, "Show Labels", group="Display")
+show_extensions = input.bool(true, "Extend Lines to Right", group="Display")
+
+// Color settings
+support_color = input.color(color.new(color.green, 20), "Support Color", group="Colors")
+resistance_color = input.color(color.new(color.red, 20), "Resistance Color", group="Colors")
+weak_alpha = input.int(60, "Weak Level Transparency", minval=0, maxval=100, group="Colors")
+strong_alpha = input.int(20, "Strong Level Transparency", minval=0, maxval=100, group="Colors")
+
+// Line style settings
+line_style = input.string("Solid", "Line Style", options=["Solid", "Dashed", "Dotted"], group="Style")
+line_width = input.int(2, "Line Width", minval=1, maxval=5, group="Style")
+
+// === HELPER FUNCTIONS ===
+
+// Convert line style string to Pine Script line style
+get_line_style() =>
+    switch line_style
+        "Solid" => line.style_solid
+        "Dashed" => line.style_dashed
+        "Dotted" => line.style_dotted
+        => line.style_solid
+
+// Calculate touch tolerance in price units
+get_tolerance(price) =>
+    price * (touch_tolerance / 100)
+
+// Check if price touches a level within tolerance
+is_touch(price, level_price) =>
+    math.abs(price - level_price) <= get_tolerance(level_price)
+
+// === PIVOT DETECTION ===
+
+// Detect pivot highs and lows
+pivot_high = ta.pivothigh(high, pivot_length, pivot_length)
+pivot_low = ta.pivotlow(low, pivot_length, pivot_length)
+
+// Store pivot points in arrays
+var pivot_highs = array.new<float>()
+var pivot_lows = array.new<float>()
+var pivot_high_bars = array.new<int>()
+var pivot_low_bars = array.new<int>()
+
+// Add new pivot points
+if not na(pivot_high)
+    array.push(pivot_highs, pivot_high)
+    array.push(pivot_high_bars, bar_index - pivot_length)
+    
+    // Keep only recent pivots
+    if array.size(pivot_highs) > lookback_bars / pivot_length
+        array.shift(pivot_highs)
+        array.shift(pivot_high_bars)
+
+if not na(pivot_low)
+    array.push(pivot_lows, pivot_low)
+    array.push(pivot_low_bars, bar_index - pivot_length)
+    
+    // Keep only recent pivots
+    if array.size(pivot_lows) > lookback_bars / pivot_length
+        array.shift(pivot_lows)
+        array.shift(pivot_low_bars)
+
+// === LEVEL DETECTION AND VALIDATION ===
+
+// Structure to store level information
+type LevelInfo
+    float price
+    int touches
+    int strength
+    int first_touch_bar
+    int last_touch_bar
+    bool is_support
+
+// Function to find levels from pivot points
+find_levels(pivots, pivot_bars, is_support_level) =>
+    levels = array.new<LevelInfo>()
+    
+    if array.size(pivots) < 2
+        levels
+    else
+        for i = 0 to array.size(pivots) - 1
+            current_price = array.get(pivots, i)
+            current_bar = array.get(pivot_bars, i)
+            touches = 1
+            first_bar = current_bar
+            last_bar = current_bar
+            
+            // Count touches from other pivots
+            for j = 0 to array.size(pivots) - 1
+                if i != j
+                    other_price = array.get(pivots, j)
+                    other_bar = array.get(pivot_bars, j)
+                    
+                    if is_touch(other_price, current_price)
+                        touches += 1
+                        if other_bar < first_bar
+                            first_bar := other_bar
+                        if other_bar > last_bar
+                            last_bar := other_bar
+            
+            // Add level if it meets minimum requirements
+            if touches >= min_touches
+                level = LevelInfo.new(
+                     price = current_price,
+                     touches = touches,
+                     strength = touches,
+                     first_touch_bar = first_bar,
+                     last_touch_bar = last_bar,
+                     is_support = is_support_level
+                 )
+                array.push(levels, level)
+        
+        levels
+
+// Get support and resistance levels
+support_levels = find_levels(pivot_lows, pivot_low_bars, true)
+resistance_levels = find_levels(pivot_highs, pivot_high_bars, false)
+
+// === LEVEL FILTERING AND SORTING ===
+
+// Function to remove duplicate levels
+remove_duplicates(levels) =>
+    if array.size(levels) <= 1
+        levels
+    else
+        unique_levels = array.new<LevelInfo>()
+        
+        for i = 0 to array.size(levels) - 1
+            current_level = array.get(levels, i)
+            is_duplicate = false
+            
+            for j = 0 to array.size(unique_levels) - 1
+                existing_level = array.get(unique_levels, j)
+                if is_touch(current_level.price, existing_level.price)
+                    is_duplicate := true
+                    // Keep the stronger level
+                    if current_level.strength > existing_level.strength
+                        array.set(unique_levels, j, current_level)
+                    break
+            
+            if not is_duplicate
+                array.push(unique_levels, current_level)
+        
+        unique_levels
+
+// Function to sort levels by strength (descending)
+sort_by_strength(levels) =>
+    if array.size(levels) <= 1
+        levels
+    else
+        // Simple bubble sort
+        for i = 0 to array.size(levels) - 2
+            for j = 0 to array.size(levels) - 2 - i
+                level1 = array.get(levels, j)
+                level2 = array.get(levels, j + 1)
+                if level1.strength < level2.strength
+                    array.set(levels, j, level2)
+                    array.set(levels, j + 1, level1)
+        levels
+
+// Filter and sort levels
+filtered_support = remove_duplicates(support_levels)
+filtered_resistance = remove_duplicates(resistance_levels)
+sorted_support = sort_by_strength(filtered_support)
+sorted_resistance = sort_by_strength(filtered_resistance)
+
+// === DRAWING FUNCTIONS ===
+
+// Clear previous drawings
+var line[] support_lines = array.new<line>()
+var line[] resistance_lines = array.new<line>()
+var label[] level_labels = array.new<label>()
+
+// Clear old lines and labels
+if barstate.islast
+    for i = 0 to array.size(support_lines) - 1
+        line.delete(array.get(support_lines, i))
+    for i = 0 to array.size(resistance_lines) - 1
+        line.delete(array.get(resistance_lines, i))
+    for i = 0 to array.size(level_labels) - 1
+        label.delete(array.get(level_labels, i))
+    
+    array.clear(support_lines)
+    array.clear(resistance_lines)
+    array.clear(level_labels)
+
+// Function to get color based on strength
+get_level_color(base_color, strength) =>
+    alpha = strength >= 4 ? strong_alpha : weak_alpha
+    color.new(base_color, alpha)
+
+// Draw support levels
+if barstate.islast and show_support
+    levels_drawn = 0
+    for i = 0 to math.min(array.size(sorted_support) - 1, max_levels - 1)
+        if levels_drawn >= max_levels
+            break
+            
+        level = array.get(sorted_support, i)
+        if level.strength >= min_strength
+            // Determine line extent
+            start_bar = show_extensions ? level.first_touch_bar : level.first_touch_bar
+            end_bar = show_extensions ? bar_index + 50 : level.last_touch_bar
+            
+            // Create line
+            level_line = line.new(
+                 x1 = start_bar,
+                 y1 = level.price,
+                 x2 = end_bar,
+                 y2 = level.price,
+                 color = get_level_color(support_color, level.strength),
+                 style = get_line_style(),
+                 width = line_width,
+                 extend = show_extensions ? extend.right : extend.none
+             )
+            array.push(support_lines, level_line)
+            
+            // Create label
+            if show_labels
+                label_text = "S: " + str.tostring(level.price, "#.##") + " (" + str.tostring(level.touches) + ")"
+                level_label = label.new(
+                     x = level.last_touch_bar,
+                     y = level.price,
+                     text = label_text,
+                     style = label.style_label_up,
+                     color = get_level_color(support_color, level.strength),
+                     textcolor = color.white,
+                     size = size.small
+                 )
+                array.push(level_labels, level_label)
+            
+            levels_drawn += 1
+
+// Draw resistance levels
+if barstate.islast and show_resistance
+    levels_drawn = 0
+    for i = 0 to math.min(array.size(sorted_resistance) - 1, max_levels - 1)
+        if levels_drawn >= max_levels
+            break
+            
+        level = array.get(sorted_resistance, i)
+        if level.strength >= min_strength
+            // Determine line extent
+            start_bar = show_extensions ? level.first_touch_bar : level.first_touch_bar
+            end_bar = show_extensions ? bar_index + 50 : level.last_touch_bar
+            
+            // Create line
+            level_line = line.new(
+                 x1 = start_bar,
+                 y1 = level.price,
+                 x2 = end_bar,
+                 y2 = level.price,
+                 color = get_level_color(resistance_color, level.strength),
+                 style = get_line_style(),
+                 width = line_width,
+                 extend = show_extensions ? extend.right : extend.none
+             )
+            array.push(resistance_lines, level_line)
+            
+            // Create label
+            if show_labels
+                label_text = "R: " + str.tostring(level.price, "#.##") + " (" + str.tostring(level.touches) + ")"
+                level_label = label.new(
+                     x = level.last_touch_bar,
+                     y = level.price,
+                     text = label_text,
+                     style = label.style_label_down,
+                     color = get_level_color(resistance_color, level.strength),
+                     textcolor = color.white,
+                     size = size.small
+                 )
+                array.push(level_labels, level_label)
+            
+            levels_drawn += 1
+
+// === ALERTS ===
+
+// Price approaching levels
+var float last_support_alert = na
+var float last_resistance_alert = na
+
+if barstate.isconfirmed
+    // Check for support level approaches
+    if show_support and array.size(sorted_support) > 0
+        closest_support = array.get(sorted_support, 0)
+        if not na(closest_support) and closest_support.strength >= min_strength
+            distance_pct = math.abs(close - closest_support.price) / closest_support.price * 100
+            if distance_pct <= touch_tolerance * 2 and (na(last_support_alert) or math.abs(closest_support.price - last_support_alert) > get_tolerance(closest_support.price))
+                alert("Price approaching Support at " + str.tostring(closest_support.price, "#.##"), alert.freq_once_per_bar)
+                last_support_alert := closest_support.price
+    
+    // Check for resistance level approaches
+    if show_resistance and array.size(sorted_resistance) > 0
+        closest_resistance = array.get(sorted_resistance, 0)
+        if not na(closest_resistance) and closest_resistance.strength >= min_strength
+            distance_pct = math.abs(close - closest_resistance.price) / closest_resistance.price * 100
+            if distance_pct <= touch_tolerance * 2 and (na(last_resistance_alert) or math.abs(closest_resistance.price - last_resistance_alert) > get_tolerance(closest_resistance.price))
+                alert("Price approaching Resistance at " + str.tostring(closest_resistance.price, "#.##"), alert.freq_once_per_bar)
+                last_resistance_alert := closest_resistance.price
+
+// === TABLE FOR LEVEL INFORMATION ===
+
+// Display level information in a table
+if barstate.islast and show_labels
+    var table info_table = table.new(position.top_right, 3, math.min(array.size(sorted_support) + array.size(sorted_resistance) + 1, 11), bgcolor=color.new(color.white, 80), border_width=1)
+    
+    // Clear table
+    table.clear(info_table, 0, 0, 2, 10)
+    
+    // Headers
+    table.cell(info_table, 0, 0, "Type", text_color=color.black, text_size=size.small)
+    table.cell(info_table, 1, 0, "Price", text_color=color.black, text_size=size.small)
+    table.cell(info_table, 2, 0, "Strength", text_color=color.black, text_size=size.small)
+    
+    row = 1
+    
+    // Support levels
+    for i = 0 to math.min(array.size(sorted_support) - 1, 5)
+        if row > 10
+            break
+        level = array.get(sorted_support, i)
+        if level.strength >= min_strength
+            table.cell(info_table, 0, row, "S", text_color=support_color, text_size=size.small)
+            table.cell(info_table, 1, row, str.tostring(level.price, "#.##"), text_color=color.black, text_size=size.small)
+            table.cell(info_table, 2, row, str.tostring(level.touches), text_color=color.black, text_size=size.small)
+            row += 1
+    
+    // Resistance levels
+    for i = 0 to math.min(array.size(sorted_resistance) - 1, 5)
+        if row > 10
+            break
+        level = array.get(sorted_resistance, i)
+        if level.strength >= min_strength
+            table.cell(info_table, 0, row, "R", text_color=resistance_color, text_size=size.small)
+            table.cell(info_table, 1, row, str.tostring(level.price, "#.##"), text_color=color.black, text_size=size.small)
+            table.cell(info_table, 2, row, str.tostring(level.touches), text_color=color.black, text_size=size.small)
+            row += 1
